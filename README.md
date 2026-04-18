@@ -2,7 +2,7 @@
 
 モシコム（https://moshicom.com/）の公開イベントページから、関西エリアのランニング・トレイル系イベントを週1回収集し、Web で検索・絞り込みできるアプリです。
 
-**スタック**: Next.js 14 (App Router) / TypeScript / Tailwind CSS / Supabase (Postgres) / Vercel
+**スタック**: Next.js 14 (App Router) / TypeScript / Tailwind CSS / Supabase (Postgres) / Playwright / Vercel
 
 ---
 
@@ -26,11 +26,19 @@ cd moshicom-app
 
 ```bash
 npm install
-# または
-pnpm install
 ```
 
-### 3. 環境変数の設定
+### 3. Playwright ブラウザのインストール
+
+クローラーは一覧収集に Playwright (Chromium) を使用します。
+
+```bash
+npx playwright install --with-deps chromium
+```
+
+> GitHub Actions で実行する場合、ワークフロー内で自動インストールされます。
+
+### 4. 環境変数の設定
 
 ```bash
 cp .env.local.example .env.local
@@ -48,6 +56,8 @@ cp .env.local.example .env.local
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Supabase の匿名公開キー |
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase のサービスロールキー（サーバー側専用・公開禁止） |
 | `CRON_SECRET` | Vercel Cron 用の認証トークン（任意の長いランダム文字列） |
+| `MOSHICOM_MAX_PAGES` | 1キーワードあたりの最大ページ数（デフォルト: `20`） |
+| `MOSHICOM_MAX_EVENTS` | 収集URL総数の上限（デフォルト: `500`） |
 
 > `SUPABASE_SERVICE_ROLE_KEY` はクライアント側には絶対に公開しないでください。
 
@@ -78,9 +88,113 @@ npm run dev
 
 ---
 
-## 手動クロール実行方法
+## まず確認するログ項目（ページネーション突破の切り分け）
 
-ローカルまたは本番環境で以下の curl コマンドを実行します:
+`npm run crawl` 実行後、以下のログを順に確認してください。
+
+### ① Playwright 一覧収集が動いているか
+
+```
+[playwright] ══════════════════════════════════════════
+[playwright] Playwright 一覧収集 開始
+[playwright]   キーワード数: 16
+[playwright]   maxPages: 20 / maxEvents: 500
+```
+
+### ② 各キーワードでページが進んでいるか（最重要）
+
+```
+[playwright]   page 1: 抽出 20 URLs | 新規 +20 | 累計 20
+[playwright]   page 1 → 2: クリック成功 (selector: .pagination a:has-text("次"))
+[playwright]   page 2: 抽出 20 URLs | 新規 +18 | 累計 38
+...
+```
+
+**ページネーション突破できていない場合:**
+
+```
+[playwright]   page 1: 次ページなし（全セレクタ不一致）
+[playwright:debug] ─── ページネーション DOM 確認 ───────────────────
+[playwright:debug] pagination要素:
+[playwright:debug]   href="#" text="2" class="..."  ← この出力を見てセレクタを特定する
+```
+
+`次ページなし` が全キーワードで出るようなら `debugLogPaginationArea` のログを確認し、
+`lib/moshicom/playwright.ts` の `navigateToNextPage()` 内 `selectorCandidates` に
+実際のセレクタを追加してください。
+
+### ③ 詳細巡回のサマリ
+
+```
+[crawler] [Step 3] 詳細巡回 完了
+[crawler]   detail fetch 対象:   280
+[crawler]   fetch 成功:          275
+[crawler]   parse → save:        195
+[crawler]   parse → skip:         80
+[crawler]   fetch / parse error:   5
+```
+
+`parse → save` が旧来の `52` より大きければページネーション突破成功です。
+
+### ④ 最終サマリ
+
+```
+[crawler] ══════════════════════════════════════════════
+[crawler] クロール 完了
+[crawler]   Playwright URL収集: 280 → 詳細対象 280
+[crawler]   save (upserted):    195
+[crawler]   skip (非対象):       85
+[crawler]   error:                5
+[crawler]   所要時間:          1234.5s
+```
+
+---
+
+## クロールの実行方法
+
+### A. スタンドアロンスクリプト（推奨）
+
+Playwright によるページネーション対応のクローラーをローカルまたは GitHub Actions で実行します。
+
+```bash
+npm run crawl
+```
+
+ローカル実行時は `.env.local` が自動で読み込まれます。
+
+出力例:
+
+```
+[crawl] ===== スクリプト起動 =====
+[playwright] 開始 maxPages=20 maxEvents=300
+[playwright] 検索: "関西 ランニング" → https://moshicom.com/search?keyword=...
+[playwright]   page 1: 20 URLs (新規 20 / 累計 20)
+[playwright]   page 2: 18 URLs (新規 15 / 累計 35)
+...
+[playwright] 収集完了: 280 URLs / 38 ページ巡回
+[crawler] [Step 3] 詳細ページ巡回 (280 件)
+...
+[crawl] ===== 完了 =====
+{
+  "fetched": 280,
+  "upserted": 195,
+  "skipped": 85,
+  "errors": 3,
+  "duration_ms": 1234567
+}
+```
+
+| フィールド | 説明 |
+|---|---|
+| `fetched` | 詳細ページ取得を試みたURL数 |
+| `upserted` | DBに保存（新規/更新）した件数 |
+| `skipped` | 関西・スポーツ条件で除外した件数 |
+| `errors` | 取得・パース失敗件数 |
+| `duration_ms` | 実行時間（ミリ秒） |
+
+### B. API 経由（Vercel / ローカル）
+
+Playwright を使わない旧来のフロー（件数は少なくなります）:
 
 ```bash
 # ローカル
@@ -89,28 +203,6 @@ curl -X POST http://localhost:3000/api/admin/crawl
 # 本番 (Vercel)
 curl -X POST https://your-app.vercel.app/api/admin/crawl
 ```
-
-レスポンス例:
-
-```json
-{
-  "result": {
-    "fetched": 120,
-    "upserted": 34,
-    "skipped": 86,
-    "errors": 2,
-    "duration_ms": 45231
-  }
-}
-```
-
-| フィールド | 説明 |
-|---|---|
-| `fetched` | 取得試行したイベント詳細URL数 |
-| `upserted` | DBに保存（新規/更新）した件数 |
-| `skipped` | 関西・スポーツ条件で除外した件数 |
-| `errors` | 取得・パース失敗件数 |
-| `duration_ms` | 実行時間（ミリ秒） |
 
 ---
 
@@ -210,46 +302,45 @@ Cron リクエストには Vercel が自動で `Authorization: Bearer <CRON_SECR
 
 ---
 
-## Playwright 版へ切り替えるべきケース
+## GitHub Actions でのクロール自動化
 
-以下のいずれかに該当する場合、`fetch + cheerio` では対応できません:
+### 推奨構成
 
-| 状況 | 判断方法 |
+Playwright を使った重いクロール処理は **GitHub Actions** で実行することを推奨します。  
+Vercel はリクエストタイムアウトの制約があるため、長時間クロールには向いていません。
+
+```
+GitHub Actions (週1自動) ─→ Supabase DB ─→ Vercel (UI表示のみ)
+```
+
+### 自動スケジュール
+
+`.github/workflows/crawl-moshicom.yml` が含まれています。
+
+| 設定 | 内容 |
 |---|---|
-| ページソースにイベントデータがない | Ctrl+U で確認。HTML に `event` 関連のテキストが見えない |
-| ローディングスピナーのみ表示 | CSR（クライアントサイドレンダリング）を使用している |
-| Network タブに `/api/events` 等の XHR がある | 直接 JSON API を叩く方が確実 |
+| スケジュール | 毎週月曜 02:00 UTC（日本時間 11:00） |
+| 手動実行 | GitHub の Actions タブ → `workflow_dispatch` |
+| タイムアウト | 90分 |
 
-### Playwright 移行の手順（概要）
+### GitHub Secrets の設定
 
-```bash
-npm install playwright
-npx playwright install chromium
-```
+GitHub リポジトリの **Settings → Secrets and variables → Actions** で以下を登録してください:
 
-`lib/moshicom/fetch.ts` の `fetchHtml()` を以下に差し替える（呼び出し側の変更は不要）:
+| Secret 名 | 値 |
+|---|---|
+| `NEXT_PUBLIC_SUPABASE_URL` | Supabase プロジェクト URL |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Supabase 匿名公開キー |
+| `SUPABASE_SERVICE_ROLE_KEY` | Supabase サービスロールキー |
 
-```typescript
-import { chromium } from 'playwright';
+### 手動実行時のパラメータ
 
-export async function fetchHtml(url: string): Promise<string | null> {
-  const browser = await chromium.launch({ headless: true });
-  try {
-    const page = await browser.newPage();
-    await page.setExtraHTTPHeaders({ 'User-Agent': USER_AGENT });
-    await page.goto(url, { timeout: REQUEST_TIMEOUT_MS, waitUntil: 'networkidle' });
-    return await page.content();
-  } catch (err) {
-    console.error(`[playwright] Error: ${url}`, err);
-    return null;
-  } finally {
-    await browser.close();
-  }
-}
-```
+`workflow_dispatch` での手動実行時に以下を指定できます:
 
-> Vercel での Playwright 実行には `@sparticuz/chromium` が必要です。  
-> ローカルや EC2 などの常設サーバーで実行する方が安定します。
+| パラメータ | デフォルト | 説明 |
+|---|---|---|
+| `max_pages` | `20` | 1キーワードあたりの最大ページ数 |
+| `max_events` | `300` | 収集URL総数の上限 |
 
 ---
 
@@ -269,6 +360,9 @@ export async function fetchHtml(url: string): Promise<string | null> {
 
 ```
 moshicom-app/
+├── .github/
+│   └── workflows/
+│       └── crawl-moshicom.yml  # GitHub Actions クロール自動化（毎週月曜）
 ├── app/
 │   ├── layout.tsx              # ルートレイアウト
 │   ├── globals.css             # Tailwind ディレクティブ
@@ -283,10 +377,13 @@ moshicom-app/
 │   ├── db.ts                   # Supabase 操作
 │   └── moshicom/
 │       ├── crawler.ts          # クロールオーケストレーター
-│       ├── fetch.ts            # HTTP取得（Playwright移行の差し替えポイント）
+│       ├── playwright.ts       # Playwright による一覧URL収集
+│       ├── fetch.ts            # HTTP取得（詳細ページ用 fetch + cheerio）
 │       ├── parse.ts            # cheerio HTML パース
 │       ├── filters.ts          # 関西/スポーツ判定・キーワード検出
 │       └── normalize.ts        # データ正規化・フラグ付与
+├── scripts/
+│   └── crawl.ts               # スタンドアロン クロール実行スクリプト
 ├── supabase/
 │   └── schema.sql              # DBスキーマ（Supabase SQL Editor に貼り付ける）
 ├── .env.local.example          # 環境変数テンプレート（プレースホルダーのみ）

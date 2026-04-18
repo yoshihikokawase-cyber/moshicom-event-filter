@@ -2,58 +2,63 @@
 // lib/moshicom/crawler.ts  — クロールオーケストレーター
 //
 // 処理フロー:
-//   1. 検索URL生成 (関西×スポーツキーワード 16クエリ)
-//   2. 一覧ページ取得 → ParsedEventListItem[] を抽出
-//   3. リスト段階で Kansai+スポーツを事前フィルタ (詳細ページ訪問を最小化)
-//   4. URL 重複除去
-//   5. 詳細ページ取得・パース
-//   6. normalizeEvent → RawEventData
-//   7. applyOrganizerStats → ProcessedEventData[]
-//   8. Supabase upsert
-//
-// ページネーション:
-//   モシコムのページリンクは href="#" (完全 JS 駆動) のため次ページ URL が取得できない。
-//   複数の検索キーワード (SEARCH_KEYWORDS) で各20件を取得することで
-//   カバレッジを補っている。Playwright 化すれば完全ページネーションが可能。
+//   1. Playwright で一覧ページを巡回 → イベントURL[] を収集
+//   2. URL を ParsedEventListItem[] に変換（メタデータは詳細ページで取得）
+//   3. 詳細ページを fetch + cheerio で取得・パース
+//   4. normalizeEvent → RawEventData（関西+スポーツフィルタ）
+//   5. applyOrganizerStats → ProcessedEventData[]
+//   6. Supabase upsert
 // ─────────────────────────────────────────────────────────────
 
-import { SEARCH_URL, SEARCH_KEYWORDS, MAX_PAGES_PER_SEARCH } from '../constants';
 import type { CrawlResult, RawEventData } from '../types';
 import { fetchHtml, randomWait } from './fetch';
-import { parseEventList, parseEventDetail, normalizeDate, ParsedEventListItem } from './parse';
+import { parseEventDetail, normalizeDate, ParsedEventListItem } from './parse';
 import { normalizeEvent, applyOrganizerStats } from './normalize';
 import { isKansai, isTargetSport } from './filters';
 import { upsertEvents } from '../db';
+import { collectMoshicomEventUrlsWithPlaywright } from './playwright';
 
-// ─── 検索URL構築 ──────────────────────────────────────────────
+// ─── 一覧URL収集（Playwright） ────────────────────────────────
 
 /**
- * 検索URLリストを構築する。
- *
- * 【新着順の実現方法】
- * ?sort=new を付与。効かない場合は一覧表示順をそのまま採用する。
- * DB 保存後は scraped_at DESC でソートするため最終的に新着順になる。
+ * Playwright でモシコム検索結果を巡回し、イベントURLを収集する。
+ * メタデータ（title/date/location）は空にして詳細ページ取得に委ねる。
+ * location_raw が空のアイテムは preFilter をスキップするため、
+ * 詳細ページの normalizeEvent() で最終的な関西+スポーツ判定が行われる。
  */
-function buildSearchUrls(): string[] {
-  return SEARCH_KEYWORDS.map((kw) => {
-    const params = new URLSearchParams({ keyword: kw, sort: 'new' });
-    return `${SEARCH_URL}?${params.toString()}`;
-  });
+async function collectListItems(): Promise<ParsedEventListItem[]> {
+  const maxPages = parseInt(process.env.MOSHICOM_MAX_PAGES ?? '20', 10);
+  const maxEvents = parseInt(process.env.MOSHICOM_MAX_EVENTS ?? '500', 10);
+
+  console.log(`[crawler] [Playwright] 一覧収集開始 maxPages=${maxPages} maxEvents=${maxEvents}`);
+
+  const urls = await collectMoshicomEventUrlsWithPlaywright({ maxPages, maxEvents });
+
+  console.log(`[crawler] [Playwright] → ${urls.length} URLs 収集`);
+
+  return urls.map((url) => ({
+    url,
+    title: '',
+    event_date_raw: '',
+    location_raw: '',
+    category_raw: '',
+    organizer_raw: '',
+  }));
 }
 
 // ─── リスト段階での事前フィルタ ──────────────────────────────
 
 /**
- * 一覧ページで取得したアイテムを Kansai + スポーツ で事前フィルタする。
- * location_raw / category_raw / title が空の場合はフィルタをスキップし
- * 詳細ページに判断を委ねる（情報なし = 除外しない）。
+ * 一覧アイテムを Kansai + スポーツ で事前フィルタする。
+ * location_raw / category_raw が空の場合はフィルタをスキップし、
+ * 詳細ページの normalizeEvent() に判断を委ねる。
+ * Playwright 収集ではメタデータが空のため実質スルー。
  */
 function preFilterListItems(items: ParsedEventListItem[]): ParsedEventListItem[] {
   return items.filter((item) => {
     const locationText = item.location_raw;
-    const categoryText = item.category_raw + ' ' + item.title;
+    const categoryText = (item.category_raw + ' ' + item.title).trim();
 
-    // location が取れていれば Kansai チェック
     if (locationText) {
       if (!isKansai(locationText)) {
         console.log(`[crawler]   preskip (非関西): ${item.title.slice(0, 30)} | ${locationText}`);
@@ -61,8 +66,7 @@ function preFilterListItems(items: ParsedEventListItem[]): ParsedEventListItem[]
       }
     }
 
-    // category / title が取れていればスポーツチェック
-    if (categoryText.trim()) {
+    if (categoryText) {
       if (!isTargetSport(categoryText)) {
         console.log(`[crawler]   preskip (スポーツ外): ${item.title.slice(0, 30)} | ${item.category_raw}`);
         return false;
@@ -71,58 +75,6 @@ function preFilterListItems(items: ParsedEventListItem[]): ParsedEventListItem[]
 
     return true;
   });
-}
-
-// ─── 一覧ページからアイテム収集 ──────────────────────────────
-
-async function collectListItems(): Promise<ParsedEventListItem[]> {
-  const allItems = new Map<string, ParsedEventListItem>(); // url → item
-  const searchUrls = buildSearchUrls();
-
-  console.log(`[crawler] 検索クエリ数: ${searchUrls.length}`);
-
-  for (const searchUrl of searchUrls) {
-    console.log(`[crawler] 検索URL: ${searchUrl}`);
-    let currentUrl: string | null = searchUrl;
-    let page = 1;
-
-    while (currentUrl && page <= MAX_PAGES_PER_SEARCH) {
-      const html = await fetchHtml(currentUrl);
-      if (!html) {
-        console.warn(`[crawler]   ページ取得失敗 (page ${page}): ${currentUrl}`);
-        break;
-      }
-
-      const { items, nextPageUrl } = parseEventList(html, currentUrl);
-
-      // raw links count のログ
-      console.log(`[crawler]   raw links count: ${items.length} (page ${page})`);
-
-      const newCount = items.filter((i) => !allItems.has(i.url)).length;
-      items.forEach((i) => { if (!allItems.has(i.url)) allItems.set(i.url, i); });
-
-      console.log(`[crawler]   新規 ${newCount} 件 / 累計 ${allItems.size} 件`);
-
-      if (items.length === 0) {
-        console.warn('[crawler]   イベント 0件。.event-card セレクタ要確認。');
-        break;
-      }
-      if (newCount === 0) {
-        console.log('[crawler]   新規なし。このクエリ終了');
-        break;
-      }
-
-      // ページネーションは JS 駆動のため nextPageUrl は常に null
-      currentUrl = nextPageUrl;
-      page++;
-
-      if (currentUrl) await randomWait();
-    }
-
-    await randomWait(); // 検索クエリ間の待機
-  }
-
-  return Array.from(allItems.values());
 }
 
 // ─── メイン実行 ───────────────────────────────────────────────
@@ -171,21 +123,33 @@ export async function runCrawl(): Promise<CrawlResult> {
   }
 
   // Step 3: 詳細ページを巡回してパース
-  console.log(`[crawler] [Step 3] 詳細ページ巡回 (${preFiltered.length} 件)`);
+  const total = preFiltered.length;
+  console.log(`[crawler] [Step 3] 詳細ページ巡回 開始 (対象: ${total} 件)`);
+
   const rawEvents: RawEventData[] = [];
   let errors = 0;
   let skipped = 0;
+  let fetchOk = 0;
 
-  for (let i = 0; i < preFiltered.length; i++) {
+  for (let i = 0; i < total; i++) {
     const item = preFiltered[i];
-    console.log(`[crawler]   [${i + 1}/${preFiltered.length}] ${item.url}`);
+    const pos = `[${i + 1}/${total}]`;
+
+    // 20件ごとに中間サマリを出す
+    if (i > 0 && i % 20 === 0) {
+      console.log(
+        `[crawler]   ── 中間サマリ ${pos}: fetchOk=${fetchOk} save=${rawEvents.length} skip=${skipped} err=${errors} ──`,
+      );
+    }
 
     const html = await fetchHtml(item.url);
     if (!html) {
       errors++;
-      if (i < preFiltered.length - 1) await randomWait();
+      console.warn(`[crawler]   ${pos} fetch失敗: ${item.url}`);
+      if (i < total - 1) await randomWait();
       continue;
     }
+    fetchOk++;
 
     try {
       const detail = parseEventDetail(html);
@@ -202,29 +166,35 @@ export async function runCrawl(): Promise<CrawlResult> {
 
       if (raw === null) {
         skipped++;
-        console.log(`[crawler]   → 詳細フィルタ除外: ${detail.title.slice(0, 30)} | ${detail.venue_or_area}`);
+        console.log(
+          `[crawler]   ${pos} skip: "${(detail.title || '(no title)').slice(0, 28)}" | ${detail.venue_or_area || '(venue不明)'}`,
+        );
       } else {
         rawEvents.push(raw);
         console.log(
-          `[crawler]   → 取得: ${raw.title.slice(0, 30)} | ${raw.prefecture} | ${raw.sport_type}`
+          `[crawler]   ${pos} save: "${raw.title.slice(0, 28)}" | ${raw.prefecture} | ${raw.sport_type}`,
         );
       }
     } catch (err) {
-      console.error(`[crawler]   パースエラー: ${item.url}`, (err as Error).message);
+      console.error(`[crawler]   ${pos} parseエラー: ${item.url}`, (err as Error).message);
       errors++;
     }
 
-    if (i < preFiltered.length - 1) await randomWait();
+    if (i < total - 1) await randomWait();
   }
 
-  // final fetched のログ
-  console.log(
-    `[crawler] [Step 3] 完了: final fetched=${rawEvents.length} / skipped=${skipped} / errors=${errors}`
-  );
+  console.log('[crawler] ──────────────────────────────────────────────');
+  console.log(`[crawler] [Step 3] 詳細巡回 完了`);
+  console.log(`[crawler]   detail fetch 対象:  ${total}`);
+  console.log(`[crawler]   fetch 成功:         ${fetchOk}`);
+  console.log(`[crawler]   parse → save:       ${rawEvents.length}`);
+  console.log(`[crawler]   parse → skip:       ${skipped}`);
+  console.log(`[crawler]   fetch / parse error: ${errors}`);
+  console.log('[crawler] ──────────────────────────────────────────────');
 
   if (rawEvents.length === 0) {
     return {
-      fetched: preFiltered.length,
+      fetched: total,
       upserted: 0,
       skipped: preSkipped + skipped,
       errors,
@@ -241,12 +211,18 @@ export async function runCrawl(): Promise<CrawlResult> {
   const upserted = await upsertEvents(processed);
 
   const duration_ms = Date.now() - startTime;
-  console.log(
-    `[crawler] ===== 完了 ===== upserted=${upserted} duration=${duration_ms}ms`
-  );
+
+  console.log('[crawler] ══════════════════════════════════════════════');
+  console.log('[crawler] クロール 完了');
+  console.log(`[crawler]   Playwright URL収集: ${total + preSkipped} → 詳細対象 ${total}`);
+  console.log(`[crawler]   save (upserted):    ${upserted}`);
+  console.log(`[crawler]   skip (非対象):      ${preSkipped + skipped}`);
+  console.log(`[crawler]   error:              ${errors}`);
+  console.log(`[crawler]   所要時間:           ${(duration_ms / 1000).toFixed(1)}s`);
+  console.log('[crawler] ══════════════════════════════════════════════');
 
   return {
-    fetched: preFiltered.length,
+    fetched: total,
     upserted,
     skipped: preSkipped + skipped,
     errors,

@@ -1,0 +1,49 @@
+name: Crawl Moshicom
+
+on:
+  # 毎週月曜 02:00 UTC（日本時間 11:00）に自動実行
+  schedule:
+    - cron: '0 2 * * 1'
+  # 手動実行も可能
+  workflow_dispatch:
+    inputs:
+      max_pages:
+        description: '1キーワードあたりの最大ページ数'
+        required: false
+        default: '20'
+      max_events:
+        description: '収集URL総数の上限'
+        required: false
+        default: '300'
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run crawler
+        run: npm run crawl
+        env:
+          # Supabase 接続情報（GitHub Secrets に登録してください）
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # クロール設定（workflow_dispatch で上書き可能）
+          MOSHICOM_MAX_PAGES: ${{ github.event.inputs.max_pages || '20' }}
+          MOSHICOM_MAX_EVENTS: ${{ github.event.inputs.max_events || '300' }}
