@@ -13,9 +13,12 @@ export function normalizeEvent(
     return { shouldSave: false, reason: 'parse_incomplete', detail: 'missing title' };
   }
 
-  const combined = `${detail.title} ${detail.venue_or_area} ${detail.description}`;
+  // Kansai 判定は title + venue_or_area のみで行う。
+  // description には他開催地の言及（「次回は京都でも開催」等）が含まれるケースがあり、
+  // それを使うと非関西イベントが誤って通過する。
+  const locationText = `${detail.title} ${detail.venue_or_area}`;
 
-  if (!isKansai(combined)) {
+  if (!isKansai(locationText)) {
     // venue_or_area も空の場合は location 情報がパースできなかった可能性
     if (!detail.venue_or_area) {
       return { shouldSave: false, reason: 'parse_incomplete', detail: 'missing location' };
@@ -23,7 +26,10 @@ export function normalizeEvent(
     return { shouldSave: false, reason: 'non_kansai' };
   }
 
-  if (!isTargetSport(combined)) {
+  // スポーツ種別判定は description も含める（種目情報が本文に書かれるケースを考慮）
+  const sportText = `${detail.title} ${detail.venue_or_area} ${detail.description}`;
+
+  if (!isTargetSport(sportText)) {
     return { shouldSave: false, reason: 'non_running' };
   }
 
@@ -35,9 +41,10 @@ export function normalizeEvent(
       event_url: url,
       event_date: detail.event_date,
       published_at: detail.published_at,
-      prefecture: detectPrefecture(combined),
+      // 都道府県も locationText から判定（description の他開催地名を除外）
+      prefecture: detectPrefecture(locationText),
       venue_or_area: detail.venue_or_area,
-      sport_type: detectSportType(combined),
+      sport_type: detectSportType(sportText),
       organizer: detail.organizer,
       description: detail.description,
     },
