@@ -4,6 +4,10 @@
 // 責務: Moshicom 検索結果ページを Playwright でページネーション巡回し、
 //       イベントURLのリストを返す。詳細取得は行わない。
 //
+// ページネーション方式: URL直叩き (?page=N)
+//   モシコムは href="#" の JS 駆動ページネーションのため、
+//   クリック方式ではなく &page=N を URL に付与して直接 goto する。
+//
 // 統合先: lib/moshicom/crawler.ts の collectListItems() から呼ばれる。
 // ─────────────────────────────────────────────────────────────
 
@@ -16,13 +20,10 @@ const DEFAULT_MAX_PAGES = parseInt(process.env.MOSHICOM_MAX_PAGES ?? '20', 10);
 /** 環境変数 MOSHICOM_MAX_EVENTS でオーバーライド可能 */
 const DEFAULT_MAX_EVENTS = parseInt(process.env.MOSHICOM_MAX_EVENTS ?? '500', 10);
 
-/** 次ページクリック後のコンテンツ更新待機 (ms) */
-const AFTER_CLICK_WAIT_MS = 2_500;
-
 /**
- * 検索結果一覧に出現する確実なセレクタ。
- * モシコムは `.event-card` を使わないため `a[href]` で代用。
- * `waitUntil: networkidle` 後に呼ぶので短いタイムアウトで十分。
+ * 次ページクリック後のコンテンツ更新待機 (ms)
+ * URL直叩き後の networkidle 待機で代替するため現在は未使用。
+ * フォールバック用に定義のみ保持。
  */
 const RESULT_READY_SELECTOR = 'a[href]';
 const RESULT_READY_TIMEOUT_MS = 3_000;
@@ -62,149 +63,12 @@ async function extractUrlsFromCurrentPage(page: Page): Promise<string[]> {
   return urls;
 }
 
-// ─── デバッグ: ページネーションDOM出力 ───────────────────────
-
-/**
- * ページネーション周辺のHTMLをログ出力する。
- * 「1ページ目で次ページなし」のときに呼んで DOM を確認するためのデバッグ補助。
- */
-async function debugLogPaginationArea(page: Page): Promise<void> {
-  console.log('[playwright:debug] ─── ページネーション DOM 確認 ───────────────────');
-
-  try {
-    // ① pagination 専用要素を優先して取得
-    const paginationHtml: string | null = await page.evaluate(() => {
-      const candidates = [
-        '.pagination',
-        '.pager',
-        '[class*="pagination"]',
-        '[class*="pager"]',
-        'nav[aria-label*="ページ"]',
-        'nav[aria-label*="page"]',
-        'nav',
-      ];
-      for (const sel of candidates) {
-        const el = document.querySelector(sel);
-        if (el) return `[${sel}] ${el.outerHTML}`;
-      }
-      return null;
-    });
-
-    if (paginationHtml) {
-      console.log('[playwright:debug] pagination要素:');
-      // 2000文字で打ち切り
-      console.log(paginationHtml.slice(0, 2000));
-      if (paginationHtml.length > 2000) {
-        console.log(`[playwright:debug] ... (${paginationHtml.length - 2000} 文字省略)`);
-      }
-    } else {
-      console.log('[playwright:debug] pagination専用要素が見つかりません。');
-    }
-
-    // ② ページ番号・次ページ候補リンクを列挙
-    const candidateLinks: string[] = await page.evaluate(() => {
-      return Array.from(document.querySelectorAll('a'))
-        .filter((a) => {
-          const t = (a.textContent ?? '').trim();
-          const h = a.getAttribute('href') ?? '';
-          return (
-            /^\d+$/.test(t) ||
-            t.includes('次') ||
-            t.includes('前') ||
-            t.includes('>') ||
-            t.includes('<') ||
-            t.includes('Next') ||
-            t.includes('Prev') ||
-            h.includes('page') ||
-            h.includes('p=')
-          );
-        })
-        .slice(0, 30)
-        .map((a) => `  href="${a.getAttribute('href')}" text="${(a.textContent ?? '').trim()}" class="${a.className}"`);
-    });
-
-    if (candidateLinks.length > 0) {
-      console.log('[playwright:debug] ページ送り候補リンク:');
-      candidateLinks.forEach((l) => console.log(l));
-    } else {
-      console.log('[playwright:debug] ページ送り候補リンクが見つかりません（1ページのみのコンテンツか、完全JS生成の可能性）。');
-    }
-
-    // ③ 現在のURL確認
-    console.log(`[playwright:debug] 現在のURL: ${page.url()}`);
-    console.log('[playwright:debug] ─────────────────────────────────────────────────');
-  } catch (err) {
-    console.warn('[playwright:debug] DOM取得エラー:', (err as Error).message);
-  }
-}
-
-// ─── 次ページへの移動 ─────────────────────────────────────────
-
-/**
- * 次ページへ移動する。
- * モシコムのページネーションは href="#" の JS 駆動のため、
- * 複数のセレクタ戦略を順に試みる。
- * 成功したセレクタ名を返す（失敗時は null）。
- */
-async function navigateToNextPage(
-  page: Page,
-  currentPageNum: number,
-): Promise<{ success: boolean; matchedSelector: string | null }> {
-  const nextNum = currentPageNum + 1;
-
-  // セレクタ候補（優先順）
-  const selectorCandidates = [
-    `a[rel="next"]`,
-    `.pagination .next a`,
-    `.pagination a.next`,
-    `.pager .next a`,
-    `a:has-text("次のページ")`,
-    `a:has-text("次へ")`,
-    `.pagination a:has-text("次")`,
-    `.pager a:has-text("次")`,
-    `.pagination a:has-text(">")`,
-    `[data-page="${nextNum}"]`,
-  ];
-
-  for (const selector of selectorCandidates) {
-    try {
-      const el = await page.$(selector);
-      if (!el) continue;
-      if (!(await el.isVisible())) {
-        console.log(`[playwright:nav]   ${selector} → 存在するが非表示`);
-        continue;
-      }
-      await el.click();
-      await page.waitForTimeout(AFTER_CLICK_WAIT_MS);
-      return { success: true, matchedSelector: selector };
-    } catch {
-      // このセレクタは使えない。次を試す。
-    }
-  }
-
-  // ページ番号テキストで直接マッチ（.pagination 内の数値リンク）
-  try {
-    const pageLinks = await page.$$('.pagination a, .pager a');
-    for (const link of pageLinks) {
-      const text = (await link.textContent())?.trim();
-      if (text === String(nextNum)) {
-        await link.click();
-        await page.waitForTimeout(AFTER_CLICK_WAIT_MS);
-        return { success: true, matchedSelector: `text="${nextNum}"` };
-      }
-    }
-  } catch {
-    // pagination リンクが存在しないページ
-  }
-
-  return { success: false, matchedSelector: null };
-}
-
-// ─── 1キーワードのページ巡回 ─────────────────────────────────
+// ─── 1キーワードのページ巡回（URL直叩き） ────────────────────
 
 /**
  * 1検索キーワードで最大 maxPages ページ分のURLを収集する。
- * 新規URLがなくなったか次ページが見つからない場合に終了。
+ * ?page=N を付与して各ページに直接 goto する方式。
+ * 新規URLがなくなった場合に終了。
  */
 async function collectUrlsForKeyword(
   page: Page,
@@ -214,23 +78,12 @@ async function collectUrlsForKeyword(
   maxPages: number,
   allUrls: Set<string>,
   maxEvents: number,
-  debugState: { fired: boolean },
 ): Promise<{ pagesScraped: number; urlsAdded: number }> {
-  const params = new URLSearchParams({ keyword, sort: 'new' });
-  const searchUrl = `${SEARCH_URL}?${params.toString()}`;
   const kwTag = `[${keywordIndex + 1}/${totalKeywords}]`;
 
   console.log(`[playwright] ──────────────────────────────────────`);
   console.log(`[playwright] キーワード${kwTag} 開始: "${keyword}"`);
-  console.log(`[playwright]   URL: ${searchUrl}`);
   console.log(`[playwright]   累計URL: ${allUrls.size} / 上限 ${maxEvents}`);
-
-  try {
-    await page.goto(searchUrl, { waitUntil: 'networkidle', timeout: REQUEST_TIMEOUT_MS });
-  } catch (err) {
-    console.warn(`[playwright] キーワード${kwTag} ページ遷移失敗:`, (err as Error).message);
-    return { pagesScraped: 0, urlsAdded: 0 };
-  }
 
   let pagesScraped = 0;
   let urlsAddedThisKeyword = 0;
@@ -241,8 +94,18 @@ async function collectUrlsForKeyword(
       break;
     }
 
-    // ページ内容の準備を確認（networkidle 後なので短時間で十分）
-    // モシコム検索結果ページは .event-card クラスを持たないため a[href] で代用
+    // ?page=N を付与してURLを生成（1ページ目は page パラメータなし）
+    const params = new URLSearchParams({ keyword, sort: 'new' });
+    if (pageNum > 1) params.set('page', String(pageNum));
+    const pageUrl = `${SEARCH_URL}?${params.toString()}`;
+
+    try {
+      await page.goto(pageUrl, { waitUntil: 'networkidle', timeout: REQUEST_TIMEOUT_MS });
+    } catch (err) {
+      console.warn(`[playwright]   page ${pageNum}: goto失敗:`, (err as Error).message);
+      break;
+    }
+
     try {
       await page.waitForSelector(RESULT_READY_SELECTOR, { timeout: RESULT_READY_TIMEOUT_MS });
     } catch {
@@ -261,7 +124,7 @@ async function collectUrlsForKeyword(
     );
 
     if (pageUrls.length === 0) {
-      console.warn(`[playwright]   page ${pageNum}: URLが0件 → .event-card セレクタ要確認`);
+      console.log(`[playwright]   page ${pageNum}: URL 0件 → 終了`);
       break;
     }
     if (newCount === 0) {
@@ -270,21 +133,6 @@ async function collectUrlsForKeyword(
     }
     if (pageNum >= maxPages) {
       console.log(`[playwright]   maxPages(${maxPages}) 到達 → このキーワードの収集終了`);
-      break;
-    }
-
-    // 次ページへ移動
-    const { success, matchedSelector } = await navigateToNextPage(page, pageNum);
-
-    if (success) {
-      console.log(`[playwright]   page ${pageNum} → ${pageNum + 1}: クリック成功 (selector: ${matchedSelector})`);
-    } else {
-      console.log(`[playwright]   page ${pageNum}: 次ページなし（全セレクタ不一致）`);
-      // ページネーション構造の確認（セッション全体で最初の1回のみ）
-      if (pageNum === 1 && !debugState.fired) {
-        debugState.fired = true;
-        await debugLogPaginationArea(page);
-      }
       break;
     }
   }
@@ -334,7 +182,6 @@ export async function collectMoshicomEventUrlsWithPlaywright(params?: {
     });
 
     const page = await context.newPage();
-    const debugState = { fired: false };
 
     for (let ki = 0; ki < SEARCH_KEYWORDS.length; ki++) {
       const keyword = SEARCH_KEYWORDS[ki];
@@ -353,7 +200,6 @@ export async function collectMoshicomEventUrlsWithPlaywright(params?: {
           maxPages,
           allUrls,
           maxEvents,
-          debugState,
         );
         totalPagesScraped += pagesScraped;
       } catch (err) {
