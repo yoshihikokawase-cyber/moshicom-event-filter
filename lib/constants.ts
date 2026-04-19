@@ -30,7 +30,12 @@ export const KANSAI_ALIASES: Record<string, string> = {
 export const SPORT_KEYWORDS = [
   'トレイルランニング',
   'トレイルラン',
+  'マラニック',
+  'ジョギング',
+  'ナイトラン',
   'トレイル',
+  'ロング走',
+  'トレラン',
   'ランニング',
   'マラソン',
 ] as const;
