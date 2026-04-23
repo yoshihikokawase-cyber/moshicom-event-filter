@@ -22,6 +22,7 @@ export interface ParsedEventDetail {
   venue_or_area: string;
   organizer: string;
   description: string;
+  category_raw: string;
 }
 
 function normalizeText(value: string): string {
@@ -224,7 +225,7 @@ function extractVenueOrArea($: ReturnType<typeof cheerio.load>): string {
   const fromVenue = extractDefinitionListText($, ['会場']);
   if (fromVenue) return fromVenue;
 
-  const fromSelectors = safeGetText($, [
+  return safeGetText($, [
     '.event-location',
     '[class*="event-location"]',
     '.location',
@@ -234,12 +235,6 @@ function extractVenueOrArea($: ReturnType<typeof cheerio.load>): string {
     '[class*="place"]',
     '[class*="area"]',
   ]);
-  if (fromSelectors) return fromSelectors;
-
-  return (
-    extractTextAfterLabel($, '開催場所', ['支払方法', '支払い方法', '代理申込', '参加費']) ||
-    extractTextAfterLabel($, '会場', ['開催場所', '支払方法', '支払い方法', '代理申込', '参加費'])
-  );
 }
 
 function extractDescription($: ReturnType<typeof cheerio.load>): string {
@@ -392,6 +387,8 @@ export function parseEventDetail(html: string): ParsedEventDetail {
     description = `${description.slice(0, DESCRIPTION_MAX_LENGTH)}...`;
   }
 
+  const category_raw = extractDefinitionListText($, ['スポーツ', 'スポーツ種目']);
+
   return {
     title,
     event_date,
@@ -399,5 +396,6 @@ export function parseEventDetail(html: string): ParsedEventDetail {
     venue_or_area: extractVenueOrArea($),
     organizer: extractOrganizer($),
     description,
+    category_raw,
   };
 }

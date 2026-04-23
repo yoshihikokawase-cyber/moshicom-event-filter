@@ -27,7 +27,7 @@ export function normalizeEvent(
   }
 
   // スポーツ種別判定は description も含める（種目情報が本文に書かれるケースを考慮）
-  const sportText = `${detail.title} ${detail.venue_or_area} ${detail.description}`;
+  const sportText = `${detail.title} ${detail.venue_or_area} ${detail.description} ${detail.category_raw}`;
 
   if (!isTargetSport(sportText)) {
     return { shouldSave: false, reason: 'non_running' };
